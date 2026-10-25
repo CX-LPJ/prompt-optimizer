@@ -1,0 +1,8 @@
+提示词优化器图标 v2
+
+生成方式：内置 imagegen 工具。PNG 为生成原图，ICO 为原图缩放封装的 Windows 多尺寸图标，保留透明背景。
+设计：青绿色圆角方形底，白色 P 字与对话气泡结合，搭配一颗闪光符号。粗线条和大面积明暗对比便于小尺寸识别。
+ICO 尺寸：16、20、24、32、40、48、64、128、256 像素。
+
+生成提示词：
+Use case: logo-brand. Asset type: a single finished Windows desktop application icon for a Chinese prompt optimizer utility, recognizable at 16px in the system tray and elegant at 256px. Create one centered app icon, no presentation board, no words outside it, no mockup. Design: a rich deep-teal rounded-square tile with beautifully restrained turquoise gradient lighting and softly beveled edges. Inside, one exceptionally clear bold white geometric P monogram, with the bowl subtly suggesting a speech bubble, plus one compact four-point mint-white sparkle at the upper right indicating improving a prompt. Keep the symbol large, balanced, simple and thick enough for small sizes. Premium contemporary desktop productivity software aesthetic, clean near-vector edges, slight dimensional depth, restrained gloss, sophisticated precise geometry. Retain the teal-and-white color identity of the existing simple P icon, but redraw it as a polished new design. Overall square composition. The tile fills most of the canvas with about 8% transparent margin for rounded corners; outside the tile must be genuinely transparent, not a checkerboard pattern. No border frame, no tiny decorative strokes, no extra symbols, no text other than the P, no watermark. Generate at the highest available quality and large resolution.

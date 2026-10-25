@@ -1,0 +1,64 @@
+<p align="center"><img src="assets/icon-v2/prompt-optimizer-v2.png" width="104" alt="Prompt Optimizer 图标"></p>
+
+# Prompt Optimizer · 提示词快捷优化
+
+Windows 托盘工具：在支持的输入框里整理提示词、用 AI 重写，或**双击空格进行中英互译**。结果填回原位置，由你决定何时发送。
+
+支持标准 Windows 文本框、Windows 记事本、提供辅助功能接口的网页输入框，以及 Codex。保留原文恢复入口；AI 返回时检查窗口、焦点及内容是否变化。
+
+## 功能
+
+| 功能 | 默认操作 | 处理方式 |
+|---|---|---|
+| 本地整理 | `Ctrl+Alt+P` | 不联网，保留原文并整理任务结构 |
+| AI 重写 | `Ctrl+Alt+Shift+P` | 使用现有 Codex 登录，改进请求本身 |
+| 恢复原文 | `Ctrl+Alt+O` | 当前文本仍为刚填入的结果时恢复 |
+| 中英互译 | 350 ms 内连按两次空格 | 中文译英文，英文译简体中文 |
+
+快捷键可在托盘的“快捷键设置”中录入，保存后立即生效。双击空格翻译可以关闭，也可固定翻译方向。面板支持手动粘贴、处理和复制。
+
+## 使用
+
+从 [Releases](https://github.com/CX-LPJ/prompt-optimizer/releases) 下载 Windows x64 便携包，解压后双击 `PromptOptimizer.exe`。运行时保留同目录的 `prompt.ico`、`ai-worker.cjs` 和 `提示词优化专用指令.txt`。
+
+本地整理只需要 Windows 和 .NET Framework 4.8。AI 重写与翻译还需要安装并登录 Codex CLI，以及 Node.js；程序可自动寻找 Codex 自带的运行时。AI 使用当前账号的模型额度，不需要在本工具中填写 API Key。
+
+仓库只提供通用配置示例。需要手动配置时，将 `config.example.json` 复制为 `config.json`。`model` 必须是当前账号可用的模型；默认值为本机验证过的 `gpt-6-luna`，其他账号不保证提供同名模型。
+
+右键托盘图标可打开面板、调整快捷键、修改翻译方向和编辑优化提示词。关闭面板会收起到托盘，退出请使用托盘菜单。默认不开机自启。
+
+## 构建与验证
+
+在 Windows PowerShell 或 PowerShell 7 中执行：
+
+```powershell
+.\build.ps1
+.\test.ps1
+.\package.ps1
+```
+
+使用 Windows 自带的 .NET Framework 编译器，不依赖 NuGet 包。离线检查包含 C# 行为检查和 Node.js 测试，不启动 AI 推理。打包结果位于 `artifacts/`，始终采用通用配置示例，不包含本地个人配置。
+
+实时 UI 检查需要可交互的 Windows 桌面、已登录的 Codex 和可用模型，会使用账号额度；详见 [验证记录](docs/VALIDATION.md)。
+
+## 行为与兼容范围
+
+双击空格处理**当前输入框内的全文**，记事本中即当前文档全文，最多 20000 字符。长按、组合键、窗口切换及检测到的输入法组词状态会跳过。部分第三方输入法和自定义编辑器尚未验证。
+
+密码框、只读框跳过。普通文本框直接填回；富文本和含引用、附件标记的控件优先预览，避免格式丢失。无法可靠读取的控件需要手动复制到面板。AI 返回时若原文、窗口或焦点变化，结果留在面板中，不覆盖新内容。工具不模拟发送键。
+
+本地模式不发送内容给模型。AI 模式只发送本次输入框文本和对应的处理指令；不会读取聊天历史或自行执行草稿里的任务。工具不保存使用过程中的提示词日志，认证由 Codex 管理。发送前仍需检查译文或改写结果。
+
+## 项目结构
+
+| 文件 | 用途 |
+|---|---|
+| `PromptOptimizer.cs` | 托盘、面板、异步处理、原文恢复 |
+| `ShortcutSettings.cs` | 可视化键位设置与冲突回退 |
+| `Translation.cs` | 双击空格手势和文本位置处理 |
+| `ExternalEditors.cs` | 原生与辅助功能输入框适配 |
+| `ai-worker.cjs` | Codex App Server 连接与文本任务 |
+| `提示词优化专用指令.txt` | 可编辑的提示词优化规则 |
+| `tests/` | 离线检查及独立 UI 测试材料 |
+
+更多说明见 [使用说明](使用说明.md)、[验证记录](docs/VALIDATION.md) 和 [更新记录](CHANGELOG.md)。

@@ -1,0 +1,12 @@
+{
+  "model": "gpt-6-luna",
+  "aiTimeoutSeconds": 35,
+  "codexPath": "",
+  "nodePath": "",
+  "localHotkey": "Ctrl+Alt+P",
+  "aiHotkey": "Ctrl+Alt+Shift+P",
+  "restoreHotkey": "Ctrl+Alt+O",
+  "doubleSpaceTranslation": true,
+  "translationTarget": "auto",
+  "doubleSpaceMilliseconds": 350
+}
