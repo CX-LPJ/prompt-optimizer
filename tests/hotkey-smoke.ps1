@@ -46,8 +46,9 @@ try {
     $watch=[Diagnostics.Stopwatch]::StartNew()
     Send-OptimizerKey 0x50
     $deadline=[DateTime]::UtcNow.AddSeconds(3)
-    do { Start-Sleep -Milliseconds 15; $current=$value.Current.Value.TrimEnd("`r","`n") } while(-not $current.StartsWith('请完成以下任务。') -and [DateTime]::UtcNow -lt $deadline)
-    if(-not $current.StartsWith('请完成以下任务。') -or -not $current.Contains($sample)){throw 'Local hotkey failed.'}
+    $expected='请查找5篇MOF荧光传感文献，附DOI，不要综述。'
+    do { Start-Sleep -Milliseconds 15; $current=$value.Current.Value.TrimEnd("`r","`n") } while($current -cne $expected -and [DateTime]::UtcNow -lt $deadline)
+    if($current -cne $expected){throw 'Local hotkey failed.'}
     $known+=$current; $measure.localHotkeyMs=$watch.Elapsed.TotalMilliseconds
     Send-OptimizerKey 0x4F
     Start-Sleep -Milliseconds 120

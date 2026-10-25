@@ -4,7 +4,15 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { CodexBridge, readInstruction, validateRewrite, translationTarget, translationInstruction } = require('../ai-worker.cjs');
+const { CodexBridge, readInstruction, validateRewrite, translationTarget, translationInstruction, selectReasoningEffort } = require('../ai-worker.cjs');
+
+test('显式推理强度优先，模型不支持时不能静默回退', () => {
+  const model = { supportedReasoningEfforts: [{ reasoningEffort: 'low' }, { reasoningEffort: 'medium' }], defaultReasoningEffort: 'medium' };
+  assert.equal(selectReasoningEffort(model, 'medium'), 'medium');
+  assert.equal(selectReasoningEffort(model, 'auto'), 'low');
+  assert.throws(() => selectReasoningEffort(model, 'high'), /不支持/);
+  assert.equal(selectReasoningEffort({ supportedReasoningEfforts: [{ reasoningEffort: 'none' }] }), 'none');
+});
 
 test('自动中英互译忽略路径与代码中的中文，支持指定方向', () => {
   assert.equal(translationTarget('请保留0.5 mM，不要加热。'), 'english');
@@ -19,10 +27,11 @@ test('自动中英互译忽略路径与代码中的中文，支持指定方向',
 
 test('翻译使用独立任务和源文本标签，不套用优化提示词', async () => {
   const b = new CodexBridge('', '', '', 'not-an-existing-prompt-file'); let instruction, input;
-  b.start = async () => {};
+  b.start = async () => { b.effort = 'medium'; };
   b.request = async (method, params) => {
-    if (method === 'thread/start') { instruction = params.baseInstructions; return { thread: { id: 'translation-test' } }; }
+    if (method === 'thread/start') { assert.equal(params.config.model_reasoning_effort, 'medium'); instruction = params.baseInstructions; return { thread: { id: 'translation-test' } }; }
     if (method === 'turn/start') {
+      assert.equal(params.effort, 'medium');
       input = params.input[0].text;
       queueMicrotask(() => {
         b.receive({ method: 'item/completed', params: { threadId: 'translation-test', item: { type: 'agentMessage', text: 'Keep 0.5 mM; do not heat.' } } });

@@ -1,5 +1,6 @@
 {
-  "model": "gpt-6-luna",
+  "model": "gpt-6.1-sol",
+  "reasoningEffort": "medium",
   "aiTimeoutSeconds": 35,
   "codexPath": "",
   "nodePath": "",

@@ -1,5 +1,6 @@
 # Local preferences and authentication files
 /config.json
+/providers*.json
 .env
 .env.*
 !.env.example

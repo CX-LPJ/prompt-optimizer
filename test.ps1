@@ -12,6 +12,6 @@ try {
     Write-Output ('C# checks passed: ' + $result.passed.Count)
     $node = Get-Command node.exe -ErrorAction SilentlyContinue
     if (-not $node) { throw 'Node.js is required to run worker tests.' }
-    & $node.Source --test (Join-Path $PSScriptRoot 'tests\worker.test.cjs')
+    & $node.Source --test (Join-Path $PSScriptRoot 'tests\worker.test.cjs') (Join-Path $PSScriptRoot 'tests\api-provider.test.cjs') (Join-Path $PSScriptRoot 'tests\runtime-stream.test.cjs')
     if ($LASTEXITCODE -ne 0) { throw 'Node.js checks failed.' }
 } finally { Pop-Location }

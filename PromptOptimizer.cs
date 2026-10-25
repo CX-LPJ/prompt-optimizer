@@ -22,7 +22,8 @@ namespace PromptQuick {
         public static string Str(Dictionary<string, object> d, string key, string fallback = "") { object v; return d.TryGetValue(key, out v) && v != null ? v.ToString() : fallback; }
     }
     public sealed class Settings {
-        public string model = "gpt-6-luna";
+        public string model = "gpt-6.1-sol";
+        public string reasoningEffort = "medium";
         public int aiTimeoutSeconds = 35;
         public string codexPath = "", nodePath = "";
         public string localHotkey = "Ctrl+Alt+P", aiHotkey = "Ctrl+Alt+Shift+P", restoreHotkey = "Ctrl+Alt+O";
@@ -33,26 +34,9 @@ namespace PromptQuick {
             string file = Path.Combine(dir, "config.json");
             var settings = File.Exists(file) ? new JavaScriptSerializer().Deserialize<Settings>(File.ReadAllText(file, Encoding.UTF8)) : new Settings();
             if (settings == null || settings.aiTimeoutSeconds < 5 || settings.aiTimeoutSeconds > 120) throw new Exception("config.json 中 aiTimeoutSeconds 必须在 5–120 之间。");
+            if (!new[] { "auto", "none", "minimal", "low", "medium", "high", "xhigh", "max" }.Contains(settings.reasoningEffort)) throw new Exception("config.json 中 reasoningEffort 必须是 auto、none、minimal、low、medium、high、xhigh 或 max。");
             if (settings.doubleSpaceMilliseconds < 150 || settings.doubleSpaceMilliseconds > 1000 || !new[] { "auto", "english", "chinese" }.Contains(settings.translationTarget)) throw new Exception("翻译方向须为 auto、english 或 chinese，双击间隔须在 150–1000 ms 之间。");
             return settings;
-        }
-    }
-    public static class LocalOptimizer {
-        const string Prefix = "请完成以下任务。\n\n任务：\n";
-        public static string Optimize(string source) {
-            if (String.IsNullOrWhiteSpace(source)) throw new Exception("请先输入需要优化的内容。");
-            if (source.Length > 20000) throw new Exception("草稿超过 20000 字符，请缩短后重试。");
-            if (source.Replace("\r\n", "\n").StartsWith(Prefix, StringComparison.Ordinal)) return source;
-            string rule = "遵守任务中给出的范围和限制；缺少关键条件时简短指出，不自行编造。";
-            if (Regex.IsMatch(source, "文献|论文检索|DOI|doi|literature|references", RegexOptions.IgnoreCase))
-                rule += " 文献信息须能追溯到真实来源，并标明无法核验之处。";
-            else if (Regex.IsMatch(source, "绘图|画图|作图|Origin|plot", RegexOptions.IgnoreCase))
-                rule += " 保留原始数据，核对坐标、单位、图例与文字，清楚说明实际改动。";
-            else if (Regex.IsMatch(source, "润色|翻译|改写|translate|polish", RegexOptions.IgnoreCase))
-                rule += " 保留原意、数字、术语和事实；优先给出可直接使用的文本。";
-            else if (Regex.IsMatch(source, "代码|程序|修复|报错|bug|code", RegexOptions.IgnoreCase))
-                rule += " 按任务范围定位相关原因，清楚区分建议、实际改动和已验证结果。";
-            return Prefix + source + "\n\n执行要求：\n" + rule + "\n\n结果：\n先给可直接使用的结果，再简要说明必要的依据、假设和未解决事项。";
         }
     }
     public static class Native {
@@ -149,9 +133,14 @@ namespace PromptQuick {
     }
     public sealed class AiClient : IDisposable {
         readonly string dir; readonly Settings settings; Process worker;
-        readonly Dictionary<int, TaskCompletionSource<Dictionary<string, object>>> pending = new Dictionary<int, TaskCompletionSource<Dictionary<string, object>>>();
+        readonly ProviderStore providers;
+        sealed class PendingRequest {
+            public TaskCompletionSource<Dictionary<string, object>> Completion = new TaskCompletionSource<Dictionary<string, object>>(TaskCreationOptions.RunContinuationsAsynchronously);
+            public IProgress<string> Progress;
+        }
+        readonly Dictionary<int, PendingRequest> pending = new Dictionary<int, PendingRequest>();
         int counter; readonly object gate = new object();
-        public AiClient(string dir, Settings settings) { this.dir = dir; this.settings = settings; }
+        public AiClient(string dir, Settings settings, ProviderStore providers = null) { this.dir = dir; this.settings = settings; this.providers = providers ?? new ProviderStore(dir, settings); }
         public static string Locate(string configured, string executable, string pattern) {
             if (!String.IsNullOrWhiteSpace(configured)) { if (!File.Exists(configured)) throw new Exception("找不到 " + configured); return configured; }
             foreach (var folder in (Environment.GetEnvironmentVariable("PATH") ?? "").Split(';')) {
@@ -175,32 +164,52 @@ namespace PromptQuick {
             worker = new Process { StartInfo = start, EnableRaisingEvents = true };
             worker.OutputDataReceived += (s, e) => { if (e.Data != null) Handle(e.Data); };
             worker.ErrorDataReceived += (s, e) => { };
-            worker.Exited += (s, e) => FailAll("AI 连接已结束，请重试。");
+            worker.Exited += (s, e) => { if (Object.ReferenceEquals(worker, s)) FailAll("AI 连接已结束，请重试。"); };
             worker.Start(); worker.StandardInput.AutoFlush = true;
             worker.BeginOutputReadLine(); worker.BeginErrorReadLine();
         }
         void Handle(string line) {
             try {
                 var value = Json.Decode(line); int id = Convert.ToInt32(value["id"]);
-                TaskCompletionSource<Dictionary<string, object>> task;
-                lock (gate) { if (!pending.TryGetValue(id, out task)) return; pending.Remove(id); }
-                if (Convert.ToBoolean(value["ok"])) task.TrySetResult(value); else task.TrySetException(new Exception(Json.Str(value, "error")));
+                PendingRequest request;
+                lock (gate) {
+                    if (!pending.TryGetValue(id, out request)) return;
+                    if (Json.Str(value, "event") != "delta") pending.Remove(id);
+                }
+                if (Json.Str(value, "event") == "delta") { if (request.Progress != null) request.Progress.Report(Json.Str(value, "text")); return; }
+                if (Convert.ToBoolean(value["ok"])) request.Completion.TrySetResult(value);
+                else if (Json.Str(value, "errorCode") == "cancelled") request.Completion.TrySetCanceled();
+                else request.Completion.TrySetException(new Exception(Json.Str(value, "error")));
             } catch { }
         }
-        void FailAll(string message) { lock (gate) { foreach (var task in pending.Values) task.TrySetException(new Exception(message)); pending.Clear(); } }
-        public async Task<Dictionary<string, object>> Request(string action, string text = "", string targetLanguage = "auto") {
+        void FailAll(string message) { lock (gate) { foreach (var request in pending.Values) request.Completion.TrySetException(new Exception(message)); pending.Clear(); } }
+        void SendCancel(int targetId) {
+            try {
+                byte[] bytes = Encoding.UTF8.GetBytes(Json.Encode(new { id = Interlocked.Increment(ref counter), action = "cancel", targetId = targetId }) + "\n");
+                lock (gate) { if (worker != null && !worker.HasExited) { worker.StandardInput.BaseStream.Write(bytes, 0, bytes.Length); worker.StandardInput.BaseStream.Flush(); } }
+            } catch { }
+        }
+        public Task<Dictionary<string, object>> Request(string action, string text = "", string targetLanguage = "auto", CancellationToken cancellationToken = default(CancellationToken), IProgress<string> progress = null) { return RequestForProvider(action, providers.Current, text, targetLanguage, cancellationToken, progress); }
+        public async Task<Dictionary<string, object>> RequestForProvider(string action, ProviderProfile profile, string text = "", string targetLanguage = "auto", CancellationToken cancellationToken = default(CancellationToken), IProgress<string> progress = null) {
+            cancellationToken.ThrowIfCancellationRequested();
             EnsureWorker();
             int id = Interlocked.Increment(ref counter);
-            var task = new TaskCompletionSource<Dictionary<string, object>>();
-            lock (gate) pending.Add(id, task);
-            var q = new { id = id, action = action, text = text, targetLanguage = targetLanguage, model = settings.model, timeoutMs = settings.aiTimeoutSeconds * 1000,
-                cwd = Path.Combine(dir, "ai-work"), codexPath = Locate(settings.codexPath, "codex.exe", @"AppData\Local\OpenAI\Codex\bin") };
-            Directory.CreateDirectory(q.cwd);
+            var request = new PendingRequest { Progress = progress };
+            lock (gate) pending.Add(id, request);
             try {
+                var q = new { id = id, action = action, text = text, targetLanguage = targetLanguage, provider = profile.Request(), timeoutMs = action == "models" ? Math.Min(15000, settings.aiTimeoutSeconds * 1000) : settings.aiTimeoutSeconds * 1000,
+                    cwd = Path.Combine(dir, "ai-work"), codexPath = profile.kind == "codex" ? Locate(settings.codexPath, "codex.exe", @"AppData\Local\OpenAI\Codex\bin") : "" };
+                Directory.CreateDirectory(q.cwd);
                 byte[] bytes = new UTF8Encoding(false).GetBytes(Json.Encode(q) + "\n");
-                worker.StandardInput.BaseStream.Write(bytes, 0, bytes.Length); worker.StandardInput.BaseStream.Flush();
-                if (await Task.WhenAny(task.Task, Task.Delay((settings.aiTimeoutSeconds + 45) * 1000)) != task.Task) { Dispose(); throw new Exception("AI 连接超时，原文已保留。"); }
-                return await task.Task;
+                try { lock (gate) { worker.StandardInput.BaseStream.Write(bytes, 0, bytes.Length); worker.StandardInput.BaseStream.Flush(); } }
+                finally { Array.Clear(bytes, 0, bytes.Length); }
+                using (cancellationToken.Register(() => {
+                    bool removed; lock (gate) removed = pending.Remove(id);
+                    if (removed) { request.Completion.TrySetCanceled(); SendCancel(id); }
+                })) {
+                    if (await Task.WhenAny(request.Completion.Task, Task.Delay((settings.aiTimeoutSeconds + 45) * 1000)) != request.Completion.Task) { SendCancel(id); Dispose(); throw new Exception("AI 连接超时，原文已保留。"); }
+                    return await request.Completion.Task;
+                }
             } finally { lock (gate) pending.Remove(id); }
         }
         public void Dispose() {
@@ -212,9 +221,18 @@ namespace PromptQuick {
         }
     }
     public sealed class OptimizerForm : Form {
-        readonly Settings settings; readonly AiClient ai; readonly NotifyIcon tray; readonly TextBox source, result;
+        readonly Settings settings; readonly AiClient ai; readonly NotifyIcon tray; readonly RichTextBox source, result;
         readonly Label status; readonly Button localButton, aiButton, translateButton; readonly string dir;
+        readonly Button stopButton, applyButton, copyButton;
+        readonly Label reviewHint;
+        readonly ToolStripMenuItem stopMenu;
+        CancellationTokenSource activeCancellation;
+        int operationVersion, streamingCount;
+        readonly StringBuilder preview = new StringBuilder();
+        Draft pendingDraft; string pendingExpected, pendingSource, pendingOriginal;
         readonly Label shortcutHint;
+        readonly ProviderStore providers;
+        ProviderDialog providerDialog;
         HotkeyRegistry hotkeys; ShortcutDialog shortcutDialog; string startupHotkeyError;
         Draft lastDraft; string original, applied; bool busy, exiting, paused;
         readonly System.Windows.Forms.Timer uiTimer = new System.Windows.Forms.Timer { Interval = 250 };
@@ -224,34 +242,41 @@ namespace PromptQuick {
         readonly System.Windows.Forms.Timer gestureTimer = new System.Windows.Forms.Timer { Interval = 100 };
         int gestureVersion; IntPtr gestureWindow;
         public OptimizerForm(string dir, Settings settings) {
-            this.dir = dir; this.settings = settings; ai = new AiClient(dir, settings);
-            Text = "提示词快捷优化"; Font = new Font("Microsoft YaHei UI", 10); Size = new Size(940, 690); MinimumSize = new Size(750, 580);
+            this.dir = dir; this.settings = settings; providers = new ProviderStore(dir, settings); ai = new AiClient(dir, settings, providers);
+            Text = "提示词快捷优化"; Font = new Font("Microsoft YaHei UI", 10); Size = new Size(1000, 810); MinimumSize = new Size(850, 700); KeyPreview = true;
             Icon = new Icon(Path.Combine(dir, "prompt.ico"), 32, 32);
             StartPosition = FormStartPosition.CenterScreen; ShowInTaskbar = true; BackColor = Color.FromArgb(248, 250, 252);
-            var layout = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(20), ColumnCount = 1, RowCount = 7 };
-            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 38)); layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 66));
+            var layout = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(20), ColumnCount = 1, RowCount = 8 };
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 38)); layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 88));
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 28)); layout.RowStyles.Add(new RowStyle(SizeType.Percent, 44));
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 28)); layout.RowStyles.Add(new RowStyle(SizeType.Percent, 56));
-            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 48));
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 64)); layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 84));
             layout.Controls.Add(new Label { Text = "把想法变成清楚、可执行的提示词", Font = new Font(Font.FontFamily, 16, FontStyle.Bold), AutoSize = true }, 0, 0);
             shortcutHint = new Label { AutoSize = true, ForeColor = Color.FromArgb(70, 80, 95) }; UpdateShortcutHint(); layout.Controls.Add(shortcutHint, 0, 1);
             layout.Controls.Add(new Label { Text = "原文（也可在这里粘贴）", AutoSize = true }, 0, 2);
-            source = new TextBox { Multiline = true, ScrollBars = ScrollBars.Vertical, Dock = DockStyle.Fill, AcceptsReturn = true, MaxLength = 20000 };
-            result = new TextBox { Multiline = true, ScrollBars = ScrollBars.Vertical, Dock = DockStyle.Fill, AcceptsReturn = true, ReadOnly = false, BackColor = Color.White };
-            layout.Controls.Add(source, 0, 3); layout.Controls.Add(new Label { Text = "优化结果（可继续编辑）", AutoSize = true }, 0, 4); layout.Controls.Add(result, 0, 5);
+            source = new RichTextBox { Name = "sourceText", Multiline = true, ScrollBars = RichTextBoxScrollBars.Vertical, Dock = DockStyle.Fill, DetectUrls = false, MaxLength = 20000, BackColor = Color.White };
+            result = new RichTextBox { Name = "resultText", Multiline = true, ScrollBars = RichTextBoxScrollBars.Vertical, Dock = DockStyle.Fill, DetectUrls = false, MaxLength = 60000, ReadOnly = false, BackColor = Color.White };
+            layout.Controls.Add(source, 0, 3); layout.Controls.Add(new Label { Text = "优化结果（生成时预览，完成后可编辑）", AutoSize = true }, 0, 4); layout.Controls.Add(result, 0, 5);
+            reviewHint = new Label { Name = "reviewHint", Text = "原文中的删除内容标红，结果中的新增内容标绿。", Dock = DockStyle.Fill, Padding = new Padding(0, 6, 0, 0), ForeColor = Color.FromArgb(70, 80, 95) };
+            layout.Controls.Add(reviewHint, 0, 6);
             var actions = new FlowLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(0, 8, 0, 0), WrapContents = true };
-            localButton = new Button { Text = "本地整理", AutoSize = true }; aiButton = new Button { Text = "AI 重写", AutoSize = true };
-            translateButton = new Button { Text = "中英互译", AutoSize = true }; translateButton.Click += async (s, e) => await Translate(false);
-            var copy = new Button { Text = "复制结果", AutoSize = true }; var hide = new Button { Text = "收起到托盘", AutoSize = true };
+            localButton = new Button { Name = "localOptimize", Text = "本地整理", AutoSize = true }; aiButton = new Button { Name = "aiOptimize", Text = "AI 重写", AutoSize = true };
+            translateButton = new Button { Name = "translateDraft", Text = "中英互译", AutoSize = true }; translateButton.Click += async (s, e) => await Translate(false);
+            copyButton = new Button { Name = "copyResult", Text = "复制结果", AutoSize = true }; var hide = new Button { Text = "收起到托盘", AutoSize = true };
+            stopButton = new Button { Name = "stopRequest", Text = "停止（Esc）", AutoSize = true, Enabled = false }; stopButton.Click += (s, e) => StopActive();
+            applyButton = new Button { Name = "applyReviewed", Text = "确认填回", AutoSize = true, Enabled = false }; applyButton.Click += async (s, e) => await ApplyReviewed();
             var configure = new Button { Text = "快捷键设置", AutoSize = true, Name = "configureShortcuts" }; configure.Click += (s, e) => OpenShortcutSettings();
+            var configureProvider = new Button { Text = "供应商与模型", AutoSize = true, Name = "configureProvider" }; configureProvider.Click += (s, e) => OpenProviderSettings();
             status = new Label { Text = "就绪", AutoSize = true, Padding = new Padding(8, 5, 0, 0) };
-            actions.Controls.AddRange(new Control[] { localButton, aiButton, translateButton, copy, configure, hide, status }); layout.Controls.Add(actions, 0, 6); Controls.Add(layout);
+            actions.Controls.AddRange(new Control[] { localButton, aiButton, translateButton, stopButton, applyButton, copyButton, configure, configureProvider, hide, status }); layout.Controls.Add(actions, 0, 7); Controls.Add(layout);
             localButton.Click += async (s, e) => await Optimize(false, false); aiButton.Click += async (s, e) => await Optimize(true, false);
-            copy.Click += (s, e) => { try { if (result.Text.Length > 0) { Clipboard.SetText(result.Text); status.Text = "已复制"; } } catch { status.Text = "剪贴板忙，请重试"; } };
+            copyButton.Click += (s, e) => { try { if (result.Text.Length > 0) { Clipboard.SetText(result.Text); status.Text = "已复制"; } } catch { status.Text = "剪贴板忙，请重试"; } };
             hide.Click += (s, e) => Hide();
             var menu = new ContextMenuStrip(); menu.Items.Add("打开优化面板", null, (s, e) => Open());
             menu.Items.Add("快捷键设置…", null, (s, e) => OpenShortcutSettings());
+            menu.Items.Add("供应商与模型…", null, (s, e) => OpenProviderSettings());
             menu.Items.Add("预热 AI 连接", null, async (s, e) => await Warm());
+            stopMenu = new ToolStripMenuItem("停止当前请求") { Enabled = false }; stopMenu.Click += (s, e) => StopActive(); menu.Items.Add(stopMenu);
             var pauseItem = new ToolStripMenuItem("暂停快捷键"); pauseItem.Click += (s, e) => {
                 if (paused) { try { RegisterKeys(); paused = false; UpdateSpaceHook(); pauseItem.Text = "暂停快捷键"; } catch (Exception ex) { Notice(ex.Message); } }
                 else { UnregisterKeys(); paused = true; UpdateSpaceHook(); pauseItem.Text = "恢复快捷键"; }
@@ -269,11 +294,11 @@ namespace PromptQuick {
             menu.Items.Add("编辑优化提示词", null, (s, e) => Process.Start("notepad.exe", "\"" + Path.Combine(dir, "提示词优化专用指令.txt") + "\""));
             menu.Items.Add("退出", null, (s, e) => { exiting = true; Close(); });
             tray = new NotifyIcon { Icon = Icon, Text = "提示词快捷优化 · 就绪", Visible = true, ContextMenuStrip = menu }; tray.DoubleClick += (s, e) => Open();
-            uiTimer.Tick += (s, e) => { if (busy && activeWatch != null) status.Text = activeOperation + " " + activeWatch.Elapsed.TotalSeconds.ToString("0.0") + "s"; };
+            uiTimer.Tick += (s, e) => { if (busy && activeWatch != null) status.Text = activeOperation + " " + activeWatch.Elapsed.TotalSeconds.ToString("0.0") + "s" + (streamingCount > 0 ? " · " + streamingCount + "字" : ""); };
             gestureTimer.Tick += async (s, e) => { gestureTimer.Stop(); if (spaceHook != null && spaceHook.Enabled && spaceHook.Generation == gestureVersion && Native.GetForegroundWindow() == gestureWindow) await Translate(true); };
             FormClosing += (s, e) => { if (!exiting) { e.Cancel = true; Hide(); } };
-            FormClosed += (s, e) => { UnregisterKeys(); gestureTimer.Stop(); if (spaceHook != null) spaceHook.Dispose(); uiTimer.Stop(); tray.Dispose(); ai.Dispose(); };
-            Shown += (s, e) => { Hide(); try { spaceHook = new DoubleSpaceHook(Handle, settings.doubleSpaceMilliseconds); UpdateSpaceHook(); } catch (Exception ex) { Notice(ex.Message); } if (startupHotkeyError != null) { Open(); OpenShortcutSettings(startupHotkeyError); } else Notice("已启动。在支持的文本框内双击空格即可中英互译。右键托盘可设置。"); };
+            FormClosed += (s, e) => { if (activeCancellation != null) activeCancellation.Cancel(); UnregisterKeys(); gestureTimer.Stop(); if (spaceHook != null) spaceHook.Dispose(); uiTimer.Stop(); tray.Dispose(); ai.Dispose(); };
+            Shown += (s, e) => { Hide(); try { spaceHook = new DoubleSpaceHook(Handle, settings.doubleSpaceMilliseconds); UpdateSpaceHook(); } catch (Exception ex) { Notice(ex.Message); } if (startupHotkeyError != null) { Open(); OpenShortcutSettings(startupHotkeyError); } else Notice(String.IsNullOrWhiteSpace(providers.LoadWarning) ? "已启动。在支持的文本框内双击空格即可中英互译。右键托盘可设置。" : providers.LoadWarning); };
         }
         public void Open() { Show(); WindowState = FormWindowState.Normal; Activate(); }
         void Notice(string text) { tray.BalloonTipTitle = "提示词快捷优化"; tray.BalloonTipText = text; tray.ShowBalloonTip(2500); }
@@ -284,8 +309,17 @@ namespace PromptQuick {
             hotkeys.Apply(new[] { settings.localHotkey, settings.aiHotkey, settings.restoreHotkey });
         }
         void UnregisterKeys() { if (hotkeys != null) hotkeys.Clear(); }
-        void UpdateShortcutHint() { shortcutHint.Text = settings.localHotkey + " 本地整理    |    " + settings.aiHotkey + " AI 重写\n" + settings.restoreHotkey + " 恢复原文    ·    支持普通文本框、记事本及网页输入框\n双击空格翻译：" + (settings.doubleSpaceTranslation ? "开启" : "关闭") + " · " + (settings.translationTarget == "auto" ? "自动中英互译" : settings.translationTarget == "english" ? "译成英文" : "译成中文"); }
-        void UpdateSpaceHook() { if (spaceHook != null) spaceHook.Enabled = settings.doubleSpaceTranslation && !paused && shortcutDialog == null && !busy; }
+        void UpdateShortcutHint() { shortcutHint.Text = settings.localHotkey + " 本地整理    |    " + settings.aiHotkey + " AI 重写\n" + settings.restoreHotkey + " 恢复原文    ·    支持普通文本框、记事本及网页输入框\n双击空格翻译：" + (settings.doubleSpaceTranslation ? "开启" : "关闭") + " · " + (settings.translationTarget == "auto" ? "自动中英互译" : settings.translationTarget == "english" ? "译成英文" : "译成中文") + "\n当前：" + providers.Current.name + " · " + providers.Current.model; }
+        void UpdateSpaceHook() { if (spaceHook != null) spaceHook.Enabled = settings.doubleSpaceTranslation && !paused && shortcutDialog == null && providerDialog == null && !busy; }
+        void OpenProviderSettings() {
+            if (busy) { Notice("请等待当前 AI 请求结束后再切换供应商。"); return; }
+            if (providerDialog != null) { providerDialog.Activate(); return; }
+            UnregisterKeys();
+            using (var dialog = new ProviderDialog(providers, ai, () => { UpdateShortcutHint(); status.Text = "供应商与模型已生效"; })) {
+                providerDialog = dialog; UpdateSpaceHook();
+                try { dialog.ShowDialog(this); } finally { providerDialog = null; UpdateSpaceHook(); if (!paused && !exiting) { try { RegisterKeys(); } catch (Exception ex) { Notice(ex.Message); } } }
+            }
+        }
         void SetTranslationPreferences(bool enabled, string target) { TranslationText.SavePreferences(dir, settings, enabled, target); settings.doubleSpaceTranslation = enabled; settings.translationTarget = target; UpdateShortcutHint(); UpdateSpaceHook(); }
         void ApplyShortcuts(string[] values) {
             var canonical = hotkeys.Apply(values, keys => ShortcutStore.Save(dir, settings, keys));
@@ -294,6 +328,7 @@ namespace PromptQuick {
             startupHotkeyError = null; UpdateShortcutHint(); status.Text = paused ? "已保存 · 暂停中" : "快捷键已生效";
         }
         void OpenShortcutSettings(string error = null) {
+            if (providerDialog != null) return;
             if (shortcutDialog != null) { shortcutDialog.Activate(); return; }
             // Pause registrations while recording so even an existing combination
             // reaches the focused input field through the normal keyboard path.
@@ -313,6 +348,7 @@ namespace PromptQuick {
             if (m.Msg == 0x8043) { exiting = true; Close(); return; }
             if (m.Msg == 0x8044) { Open(); OpenShortcutSettings(); return; }
             if (m.Msg == 0x8045) { if (!busy && !paused && shortcutDialog == null && settings.doubleSpaceTranslation) { gestureVersion = m.WParam.ToInt32(); gestureWindow = m.LParam; gestureTimer.Stop(); gestureTimer.Start(); } return; }
+            if (m.Msg == 0x8046) { Open(); OpenProviderSettings(); return; }
             if (m.Msg == 0x0312) {
                 int action; string shortcut;
                 if (hotkeys == null || !hotkeys.TryAction(m.WParam.ToInt32(), out action, out shortcut)) return;
@@ -321,41 +357,121 @@ namespace PromptQuick {
             }
             base.WndProc(ref m);
         }
-        async void HandleOptimizeHotkey(bool useAi) { await Optimize(useAi, true); }
+        async void HandleOptimizeHotkey(bool useAi) { if (providerDialog == null) await Optimize(useAi, true); }
+        protected override bool ProcessCmdKey(ref Message message, Keys keyData) {
+            if (keyData == Keys.Escape && busy) { StopActive(); return true; }
+            return base.ProcessCmdKey(ref message, keyData);
+        }
+        int BeginAiOperation(string name, bool clearPreview = true) {
+            busy = true; activeOperation = name; activeCancellation = new CancellationTokenSource(); operationVersion++;
+            activeWatch = Stopwatch.StartNew(); streamingCount = 0; preview.Clear();
+            aiButton.Enabled = localButton.Enabled = translateButton.Enabled = false;
+            source.ReadOnly = result.ReadOnly = true; copyButton.Enabled = false;
+            stopButton.Enabled = stopMenu.Enabled = true; applyButton.Enabled = false;
+            if (clearPreview) {
+                pendingDraft = null; pendingExpected = pendingSource = pendingOriginal = null; result.Clear(); TextReview.Reset(source);
+                reviewHint.ForeColor = Color.FromArgb(70, 80, 95); reviewHint.Text = "正在生成。下方是未完成预览，完成并检查后才会填回。";
+            }
+            UpdateSpaceHook(); uiTimer.Start(); tray.Text = "提示词快捷优化 · " + name;
+            return operationVersion;
+        }
+        IProgress<string> PreviewProgress(int version, CancellationToken token) {
+            return new Progress<string>(delta => {
+                if (IsDisposed || !busy || version != operationVersion || token.IsCancellationRequested || String.IsNullOrEmpty(delta)) return;
+                int length = Math.Min(delta.Length, 60000 - preview.Length);
+                if (length <= 0) return;
+                preview.Append(delta, 0, length); streamingCount = preview.Length;
+                result.AppendText(delta.Substring(0, length)); result.SelectionStart = result.TextLength; result.ScrollToCaret();
+            });
+        }
+        void StopActive() {
+            if (!busy || activeCancellation == null || activeCancellation.IsCancellationRequested) return;
+            operationVersion++; activeCancellation.Cancel(); stopButton.Enabled = stopMenu.Enabled = false;
+            status.Text = "正在停止…";
+        }
+        void EndAiOperation() {
+            busy = false; activeWatch = null; uiTimer.Stop();
+            if (activeCancellation != null) { activeCancellation.Dispose(); activeCancellation = null; }
+            if (IsDisposed) return;
+            source.ReadOnly = result.ReadOnly = false; copyButton.Enabled = true;
+            aiButton.Enabled = localButton.Enabled = translateButton.Enabled = true;
+            stopButton.Enabled = stopMenu.Enabled = false;
+            applyButton.Enabled = pendingDraft != null && !pendingDraft.PreviewOnly;
+            UpdateSpaceHook();
+        }
+        static string[] ReviewWarnings(Dictionary<string, object> response) {
+            object value;
+            if (response == null || !response.TryGetValue("reviewWarnings", out value) || value is string) return new string[0];
+            var values = value as System.Collections.IEnumerable;
+            if (values == null) return new string[0];
+            return values.Cast<object>().Where(v => v != null).Select(v => v.ToString()).ToArray();
+        }
+        void FinishOutput(Draft draft, string expected, string output, Dictionary<string, object> response = null, string restoreOriginal = null) {
+            result.Text = output; TextReview.Highlight(source, result);
+            string[] warnings = ReviewWarnings(response); object flag;
+            bool review = warnings.Length > 0 || (response != null && response.TryGetValue("requiresReview", out flag) && Convert.ToBoolean(flag));
+            pendingDraft = null; pendingExpected = pendingSource = pendingOriginal = null; applyButton.Enabled = false;
+            bool unchanged = draft != null && Draft.SameText(expected, output);
+            bool filled = !review && !unchanged && draft != null && draft.Replace(expected, output);
+            if (filled) { lastDraft = draft; original = restoreOriginal ?? expected; applied = Draft.Read(draft.Editor); }
+            if (draft != null && !filled && (!unchanged || review)) {
+                pendingDraft = draft; pendingExpected = expected; pendingSource = source.Text; pendingOriginal = restoreOriginal ?? expected;
+                applyButton.Enabled = !busy && !draft.PreviewOnly;
+            }
+            reviewHint.ForeColor = review ? Color.FromArgb(165, 80, 20) : Color.FromArgb(70, 80, 95);
+            if (review) reviewHint.Text = "需要核对，结果尚未填回：" + (warnings.Length > 0 ? String.Join("；", warnings.Take(3).ToArray()) : "关键内容可能变化。") + "\n检查高亮差异后，可选择“确认填回”或复制结果。";
+            else if (pendingDraft != null) reviewHint.Text = draft.PreviewOnly ? "此控件需要保留格式，请检查差异后复制结果使用。" : "原输入框、焦点或内容发生变化，结果留在面板。确认原文后可点击“确认填回”。";
+            else reviewHint.Text = unchanged ? "原文已清楚，本次未作改动。" : "原文中的删除内容标红，结果中的新增内容标绿。";
+            if (pendingDraft != null) { Open(); Notice(review ? "关键内容可能变化，请先检查面板中的差异。" : "结果已留在面板，请检查后使用。"); }
+        }
+        async Task ApplyReviewed() {
+            if (busy || pendingDraft == null || pendingDraft.PreviewOnly) return;
+            try {
+                if (source.Text != pendingSource) throw new Exception("面板原文已编辑，请重新优化后再填回。");
+                if (String.IsNullOrWhiteSpace(result.Text) || result.Text.Length > 60000) throw new Exception("请先检查结果正文。");
+                var draft = pendingDraft; string expected = pendingExpected, replacement = result.Text;
+                Native.SetForegroundWindow(draft.Window); draft.Editor.SetFocus(); await Task.Delay(120);
+                if (!draft.Replace(expected, replacement)) { Open(); throw new Exception("原输入框已变化，未覆盖内容。请检查后手动使用结果。"); }
+                lastDraft = draft; original = pendingOriginal; applied = Draft.Read(draft.Editor);
+                pendingDraft = null; pendingExpected = pendingSource = pendingOriginal = null; applyButton.Enabled = false;
+                status.Text = "已确认填回"; reviewHint.ForeColor = Color.FromArgb(40, 110, 65); reviewHint.Text = "结果已由你确认填回，可使用恢复原文快捷键撤回。";
+            } catch (Exception error) { Open(); Notice(error.Message); }
+        }
         async Task Warm() {
-            try { var response = await ai.Request("warmup"); status.Text = "AI 连接已就绪"; Notice("AI 连接已就绪，模型 " + settings.model + "。" ); }
-            catch (Exception e) { Notice(e.Message); }
+            if (busy || providerDialog != null) return;
+            BeginAiOperation("AI 连接中", false);
+            var token = activeCancellation.Token;
+            try { await ai.Request("warmup", cancellationToken: token); token.ThrowIfCancellationRequested(); status.Text = "AI 连接已就绪"; Notice("AI 连接已就绪，" + providers.Current.name + " · " + providers.Current.model + "。"); }
+            catch (OperationCanceledException) { status.Text = "连接已停止"; }
+            catch (Exception error) { status.Text = "连接未完成"; Notice(error.Message); }
+            finally { EndAiOperation(); }
         }
         async Task Optimize(bool useAi, bool fromHotkey) {
-            if (busy) { Notice("AI 正在改写，请稍候。"); return; }
-            Draft draft = null;
+            if (busy) { Notice("AI 正在处理，可在面板或托盘中停止。"); return; }
+            Draft draft = null; bool started = false;
             try {
                 string input;
                 if (fromHotkey) { draft = Draft.Capture(); input = draft.Text; } else input = source.Text;
                 if (String.IsNullOrWhiteSpace(input)) throw new Exception("请先输入需要优化的内容。");
                 if (input.Length > 20000) throw new Exception("草稿超过 20000 字符，请缩短后重试。");
-                // Keep the source visible/recoverable in memory before any editor write.
                 source.Text = input;
-                string output;
                 var watch = Stopwatch.StartNew();
                 if (useAi) {
-                    busy = true; activeOperation = "AI 重写中"; aiButton.Enabled = localButton.Enabled = translateButton.Enabled = false; UpdateSpaceHook(); activeWatch = watch; uiTimer.Start();
-                    tray.Text = "提示词快捷优化 · AI 重写中";
-                    var response = await ai.Request("optimize", input); output = Json.Str(response, "result");
-                } else output = LocalOptimizer.Optimize(input);
-                result.Text = output;
-                bool filled = draft != null && draft.Replace(input, output);
-                if (filled) { lastDraft = draft; original = input; applied = Draft.Read(draft.Editor); }
+                    int version = BeginAiOperation("AI 重写中"); started = true; var token = activeCancellation.Token;
+                    var response = await ai.Request("optimize", input, cancellationToken: token, progress: PreviewProgress(version, token));
+                    token.ThrowIfCancellationRequested(); FinishOutput(draft, input, Json.Str(response, "result"), response);
+                } else FinishOutput(draft, input, LocalOptimizer.Optimize(input));
                 status.Text = (useAi ? "AI " : "本地 ") + watch.Elapsed.TotalMilliseconds.ToString("0") + " ms";
                 tray.Text = "提示词快捷优化 · " + status.Text;
-                if (draft != null && !filled) { Open(); Notice(draft.PreviewOnly ? "此控件保留格式，结果已放入面板，请手动使用。" : "草稿或焦点已变化。结果已留在面板，请自行复制使用。"); }
-                else if (useAi && filled) Notice("AI 改写已填回，耗时 " + watch.Elapsed.TotalSeconds.ToString("0.0") + " 秒。");
-            } catch (Exception e) { status.Text = "未完成"; Notice(e.Message); }
-            finally { busy = false; activeWatch = null; uiTimer.Stop(); aiButton.Enabled = localButton.Enabled = translateButton.Enabled = true; UpdateSpaceHook(); }
+            } catch (OperationCanceledException) {
+                pendingDraft = null; pendingExpected = pendingSource = null; status.Text = "已停止";
+                reviewHint.Text = "已停止。下方仅保留未完成预览，原输入框未填回。";
+            } catch (Exception error) { status.Text = "未完成"; reviewHint.Text = "请求未完成，原文已保留。"; Notice(error.Message); }
+            finally { if (started) EndAiOperation(); }
         }
         async Task Translate(bool fromGesture) {
             if (busy) return;
-            Draft draft = null; string input, expected = null;
+            Draft draft = null; bool started = false; string input, expected = null;
             try {
                 if (fromGesture) {
                     if (DoubleSpaceHook.IsComposing(Native.GetForegroundWindow())) return;
@@ -365,24 +481,24 @@ namespace PromptQuick {
                 } else input = source.Text;
                 if (String.IsNullOrWhiteSpace(input)) { if (!fromGesture) Notice("请先输入需要翻译的内容。"); return; }
                 if (input.Length > 20000) throw new Exception("草稿超过 20000 字符，请缩短后重试。");
-                source.Text = input; busy = true; activeOperation = "翻译中";
-                aiButton.Enabled = localButton.Enabled = translateButton.Enabled = false; UpdateSpaceHook();
-                var watch = Stopwatch.StartNew(); activeWatch = watch; uiTimer.Start(); tray.Text = "提示词快捷优化 · 翻译中";
-                var response = await ai.Request("translate", input, settings.translationTarget); string output = Json.Str(response, "result"); result.Text = output;
-                bool filled = draft != null && draft.Replace(expected, output);
-                if (filled) { lastDraft = draft; original = input; applied = Draft.Read(draft.Editor); }
-                status.Text = "翻译 " + watch.Elapsed.TotalSeconds.ToString("0.0") + "s"; tray.Text = "提示词快捷优化 · " + status.Text;
-                if (draft != null && !filled) { Open(); Notice(draft.PreviewOnly ? "此控件保留格式，译文已放入面板，请手动使用。" : "草稿或焦点已变化。译文已留在面板，请自行复制使用。"); }
-                else if (filled) Notice("译文已填回，可按 " + settings.restoreHotkey + " 恢复原文。");
-            } catch (Exception ex) { status.Text = "翻译未完成"; Notice(ex.Message); }
-            finally { busy = false; activeWatch = null; uiTimer.Stop(); aiButton.Enabled = localButton.Enabled = translateButton.Enabled = true; UpdateSpaceHook(); }
+                source.Text = input;
+                int version = BeginAiOperation("翻译中"); started = true; var token = activeCancellation.Token;
+                var response = await ai.Request("translate", input, settings.translationTarget, token, PreviewProgress(version, token));
+                token.ThrowIfCancellationRequested(); FinishOutput(draft, expected, Json.Str(response, "result"), response, input);
+                status.Text = "翻译 " + activeWatch.Elapsed.TotalSeconds.ToString("0.0") + "s"; tray.Text = "提示词快捷优化 · " + status.Text;
+            } catch (OperationCanceledException) {
+                pendingDraft = null; pendingExpected = pendingSource = null; status.Text = "已停止";
+                reviewHint.Text = "翻译已停止。下方仅为未完成预览，原输入框未填回。";
+            } catch (Exception error) { status.Text = "翻译未完成"; reviewHint.Text = "请求未完成，原文已保留。"; Notice(error.Message); }
+            finally { if (started) EndAiOperation(); }
         }
+
         void Restore() {
             if (busy) { Notice("AI 正在改写，请返回后恢复。"); return; }
             try {
                 if (lastDraft == null) throw new Exception("当前没有可恢复的优化记录。");
                 if (!lastDraft.Replace(applied, original)) throw new Exception("当前草稿已变化。原文仍在优化面板中，可手动复制。");
-                lastDraft = null; status.Text = "已恢复原文"; tray.Text = "提示词快捷优化 · 已恢复原文";
+                lastDraft = null; status.Text = "已恢复原文"; reviewHint.ForeColor = Color.FromArgb(70, 80, 95); reviewHint.Text = "已恢复原输入框中的原文；当前结果保留供核对。"; tray.Text = "提示词快捷优化 · 已恢复原文";
             } catch (Exception e) { Notice(e.Message); }
         }
     }
@@ -416,8 +532,8 @@ namespace PromptQuick {
             Action<bool, string> check = (condition, name) => { if (!condition) throw new Exception("FAIL: " + name); checks.Add(name); };
             string raw = "  帮我找5篇MOF文献，2023–2026年，不要综述。\r\n路径 E:\\测试 目录\\data.csv；浓度0.5 mM，DOI:10.1000/example  ";
             string optimized = LocalOptimizer.Optimize(raw);
-            check(optimized.Contains(raw), "保留原文、数字、路径、单位及否定条件");
-            check(LocalOptimizer.Optimize(optimized) == optimized, "重复优化不叠加模板");
+            check(optimized.Contains("5篇") && optimized.Contains("2023–2026") && optimized.Contains(@"E:\测试 目录\data.csv") && optimized.Contains("0.5 mM") && optimized.Contains("不要综述") && optimized.Contains("10.1000/example"), "本地改写保留数字、路径、单位及否定条件");
+            check(LocalOptimizer.Optimize(optimized) == optimized, "重复整理不叠加或改变已改写内容");
             bool rejected = false; try { LocalOptimizer.Optimize(" \r\n"); } catch { rejected = true; } check(rejected, "空草稿拒绝");
             rejected = false; try { LocalOptimizer.Optimize(new string('a', 20001)); } catch { rejected = true; } check(rejected, "过长草稿拒绝");
             check(LocalOptimizer.Optimize("Translate ‘Do not remove 5.2 mg.’").Contains("5.2 mg"), "英文与标点保留");
@@ -427,8 +543,11 @@ namespace PromptQuick {
             rejected = false; try { Hotkey.Parse("P"); } catch { rejected = true; } check(rejected, "拒绝占用普通输入键");
             checks.AddRange(HotkeyTests.Run());
             checks.AddRange(TranslationTests.Run());
+            checks.AddRange(ProviderTests.Run());
+            checks.AddRange(LocalOptimizerTests.Run());
+            checks.AddRange(TextReview.Tests());
             var watch = Stopwatch.StartNew(); for (int i = 0; i < 1000; i++) LocalOptimizer.Optimize(raw); watch.Stop();
-            File.WriteAllText(report, Json.Encode(new { ok = true, passed = checks, localAverageMs = watch.Elapsed.TotalMilliseconds / 1000 }), new UTF8Encoding(false));
+            File.WriteAllText(report, Json.Encode(new { ok = true, passed = checks, localAverageMs = watch.Elapsed.TotalMilliseconds / 1000, localExample = LocalOptimizer.Optimize("帮我找5篇MOF文献，要DOI，不要综述，先给列表确认后再下载。") }), new UTF8Encoding(false));
             return 0;
         }
         static int UiSmoke(string report) {

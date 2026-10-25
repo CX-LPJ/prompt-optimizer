@@ -16,7 +16,7 @@ public static class PromptLocalUpdate {
  [DllImport("user32.dll")]public static extern bool PostMessage(IntPtr h,uint m,IntPtr w,IntPtr l);
  public static string Text(IntPtr h){var t=new StringBuilder(256);ReadText(h,13,(IntPtr)256,t);return t.ToString();}
  public static IntPtr Main(uint pid){IntPtr found=IntPtr.Zero;EnumWindows((h,p)=>{uint actual;GetWindowThreadProcessId(h,out actual);if(actual==pid&&Text(h)=="提示词快捷优化"){found=h;return false;}return true;},IntPtr.Zero);return found;}
- public static bool Busy(IntPtr main){bool busy=false;EnumChildWindows(main,(h,p)=>{string t=Text(h);if(t.StartsWith("AI 重写中 ")||t.StartsWith("翻译中 "))busy=true;return true;},IntPtr.Zero);return busy;}
+ public static bool Busy(IntPtr main){bool busy=false;uint owner;GetWindowThreadProcessId(main,out owner);EnumWindows((h,p)=>{uint actual;GetWindowThreadProcessId(h,out actual);if(actual==owner&&h!=main&&(Text(h)=="供应商与模型"||Text(h)=="快捷键设置"))busy=true;return true;},IntPtr.Zero);EnumChildWindows(main,(h,p)=>{string t=Text(h);if(t.StartsWith("AI 重写中 ")||t.StartsWith("翻译中 ")||t.StartsWith("AI 连接中 "))busy=true;return true;},IntPtr.Zero);return busy;}
 }
 '@
 foreach($process in @(Get-Process -Name PromptOptimizer -ErrorAction SilentlyContinue | Where-Object {$_.Path -eq $exe})){

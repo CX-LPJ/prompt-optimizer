@@ -87,11 +87,11 @@ try{
     $editor=@($codex.FindAll([System.Windows.Automation.TreeScope]::Descendants,(New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty,[System.Windows.Automation.ControlType]::Edit))) | Where-Object { $_.Current.ClassName.Split(' ') -contains 'ProseMirror' })[0]
     $v=$editor.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)
     if($v.Current.Value.Trim() -cne $editor.Current.Name -and $v.Current.Value.Trim().Length -ne 0){throw 'Draft not empty; test stopped.'}
-    $sample='只分析错误原因，不修改代码。';$known=@($sample)
+    $sample='帮我分析错误原因，不要修改代码。';$known=@($sample)
     try{
         $editor.SetFocus();$v.SetValue($sample);Start-Sleep -Milliseconds 180;Send-Combination $new[0];Start-Sleep -Milliseconds 400
         $optimized=$v.Current.Value.TrimEnd("`r","`n")
-        if(-not $optimized.StartsWith('请完成以下任务。') -or -not $optimized.Contains($sample)){throw 'New local hotkey did not apply immediately.'}
+        if($optimized -cne '请分析错误原因，不要修改代码。'){throw 'New local hotkey did not apply immediately.'}
         $known+=$optimized;Send-Combination $new[2];Start-Sleep -Milliseconds 180
         if($v.Current.Value.TrimEnd("`r","`n") -cne $sample){throw 'New restore hotkey failed.'}
     }finally{if($known -ccontains $v.Current.Value.TrimEnd("`r","`n")){$v.SetValue('')}}
